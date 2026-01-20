@@ -1,0 +1,6 @@
+name: NyaaDataFixer
+main: cat.nyaa.datafixer.NyaaDataFixer
+version: ${version}
+description: "One-shot migration tool for updating stored item/entity NBT data"
+depend: [NyaaCore]
+api-version: 1.13

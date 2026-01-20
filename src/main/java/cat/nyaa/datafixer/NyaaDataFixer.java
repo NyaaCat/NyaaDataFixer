@@ -1,0 +1,662 @@
+package cat.nyaa.datafixer;
+
+import cat.nyaa.nyaacore.configuration.NbtItemStack;
+import cat.nyaa.nyaacore.utils.ItemStackUtils;
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import com.mojang.datafixers.DataFixer;
+import com.mojang.serialization.Dynamic;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
+import net.minecraft.nbt.TagParser;
+import net.minecraft.util.datafix.DataFixers;
+import net.minecraft.util.datafix.fixes.References;
+import org.bukkit.Bukkit;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.InvalidConfigurationException;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.FileSystems;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.sql.*;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
+
+public class NyaaDataFixer extends JavaPlugin {
+    private static final int DEFAULT_ITEMSTACK_DATA_VERSION = 1139;
+    private static final Pattern BASE64_PATTERN = Pattern.compile("^[A-Za-z0-9+/=]+$");
+
+    private int currentDataVersion;
+
+    @Override
+    public void onEnable() {
+        saveDefaultConfig();
+        currentDataVersion = Bukkit.getUnsafe().getDataVersion();
+
+        MigrationConfig config = MigrationConfig.from(this);
+        MigrationStats total = new MigrationStats();
+
+        Path pluginsDir = getServer().getPluginsFolder().toPath();
+        for (String target : config.targets) {
+            Path targetDir = pluginsDir.resolve(target);
+            if (!Files.exists(targetDir)) {
+                getLogger().info("Skip missing target: " + targetDir);
+                continue;
+            }
+            migrateTarget(targetDir, config, total);
+        }
+
+        getLogger().info(String.format(
+                "Migration done. scanned=%d updated=%d base64=%d itemStacks=%d nbt=%d dbFiles=%d dbUpdates=%d dbCells=%d errors=%d",
+                total.filesScanned, total.filesUpdated, total.base64Updated,
+                total.itemStackUpdated, total.entityNbtUpdated,
+                total.dbFilesScanned, total.dbFilesUpdated, total.dbCellsUpdated, total.errors));
+
+        if (config.disableAfterRun) {
+            getServer().getPluginManager().disablePlugin(this);
+        }
+    }
+
+    private void migrateTarget(Path targetDir, MigrationConfig config, MigrationStats total) {
+        try (Stream<Path> stream = Files.walk(targetDir)) {
+            stream.filter(Files::isRegularFile)
+                    .filter(path -> isYamlFile(path.getFileName().toString()))
+                    .filter(path -> !isExcluded(path, targetDir, config.excludeDirs))
+                    .forEach(path -> migrateFile(path, targetDir, config, total));
+        } catch (IOException ex) {
+            total.errors++;
+            getLogger().warning("Failed to scan " + targetDir + ": " + ex.getMessage());
+        }
+        migrateSqliteTargets(targetDir, config, total);
+    }
+
+    private void migrateFile(Path file, Path targetDir, MigrationConfig config, MigrationStats total) {
+        total.filesScanned++;
+        YamlConfiguration yaml = new YamlConfiguration();
+        try {
+            yaml.load(file.toFile());
+        } catch (IOException | InvalidConfigurationException ex) {
+            total.errors++;
+            getLogger().warning("Failed to read " + file + ": " + ex.getMessage());
+            return;
+        }
+
+        MigrationStats fileStats = new MigrationStats();
+        boolean changed = upgradeSection(yaml, fileStats);
+        if (!changed) {
+            return;
+        }
+
+        total.merge(fileStats);
+        total.filesUpdated++;
+
+        if (config.dryRun) {
+            getLogger().info("Would update " + file);
+            return;
+        }
+
+        try {
+            backupFile(file, targetDir, config);
+            yaml.save(file.toFile());
+        } catch (IOException ex) {
+            total.errors++;
+            getLogger().warning("Failed to write " + file + ": " + ex.getMessage());
+        }
+    }
+
+    private void migrateSqliteTargets(Path targetDir, MigrationConfig config, MigrationStats total) {
+        if (!config.sqliteEnabled || config.sqliteMatchers.isEmpty()) {
+            return;
+        }
+        try (Stream<Path> stream = Files.walk(targetDir)) {
+            stream.filter(Files::isRegularFile)
+                    .filter(path -> matchesSqlitePattern(path.getFileName(), config.sqliteMatchers))
+                    .forEach(path -> migrateSqliteFile(path, targetDir, config, total));
+        } catch (IOException ex) {
+            total.errors++;
+            getLogger().warning("Failed to scan sqlite files in " + targetDir + ": " + ex.getMessage());
+        }
+    }
+
+    private boolean matchesSqlitePattern(Path fileName, List<java.nio.file.PathMatcher> matchers) {
+        for (var matcher : matchers) {
+            if (matcher.matches(fileName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void migrateSqliteFile(Path dbFile, Path targetDir, MigrationConfig config, MigrationStats total) {
+        total.dbFilesScanned++;
+        boolean updated = false;
+        try {
+            try {
+                Class.forName("org.sqlite.JDBC");
+            } catch (ClassNotFoundException ignored) {
+                // Driver might be loaded via SPI.
+            }
+            try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + dbFile.toAbsolutePath())) {
+                connection.setAutoCommit(false);
+                List<String> tables = listTables(connection);
+                for (String table : tables) {
+                    if (config.sqliteExcludeTables.contains(normalizeIdentifier(table))) {
+                        continue;
+                    }
+                    TableSchema schema = readSchema(connection, table);
+                    if (schema.textColumns.isEmpty()) {
+                        continue;
+                    }
+                    for (String column : schema.textColumns) {
+                        if (config.sqliteExcludeColumns.contains(normalizeIdentifier(column))) {
+                            continue;
+                        }
+                        updated |= updateSqliteColumn(connection, table, column, schema, config, total);
+                    }
+                }
+                if (updated && !config.dryRun) {
+                    connection.commit();
+                    total.dbFilesUpdated++;
+                } else {
+                    connection.rollback();
+                }
+            }
+        } catch (SQLException ex) {
+            total.errors++;
+            getLogger().warning("Failed to migrate sqlite " + dbFile + ": " + ex.getMessage());
+        }
+        if (updated && config.dryRun) {
+            getLogger().info("Would update sqlite " + dbFile);
+        }
+    }
+
+    private boolean updateSqliteColumn(Connection connection, String table, String column, TableSchema schema,
+                                       MigrationConfig config, MigrationStats total) throws SQLException {
+        if (schema.hasRowId) {
+            return updateSqliteColumnWithRowId(connection, table, column, config, total);
+        }
+        if (schema.primaryKeys.isEmpty()) {
+            return false;
+        }
+        return updateSqliteColumnWithPrimaryKey(connection, table, column, schema.primaryKeys, config, total);
+    }
+
+    private boolean updateSqliteColumnWithRowId(Connection connection, String table, String column,
+                                                MigrationConfig config, MigrationStats total) throws SQLException {
+        String selectSql = "SELECT rowid, \"" + column + "\" FROM \"" + table + "\" WHERE \"" + column + "\" IS NOT NULL";
+        String updateSql = "UPDATE \"" + table + "\" SET \"" + column + "\"=? WHERE rowid=?";
+        boolean updated = false;
+        try (Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery(selectSql);
+             PreparedStatement update = connection.prepareStatement(updateSql)) {
+            while (rs.next()) {
+                long rowId = rs.getLong(1);
+                String value = rs.getString(2);
+                if (value == null) {
+                    continue;
+                }
+                String upgraded = upgradeString(value, total);
+                if (upgraded != null && !upgraded.equals(value)) {
+                    update.setString(1, upgraded);
+                    update.setLong(2, rowId);
+                    update.executeUpdate();
+                    updated = true;
+                    total.dbCellsUpdated++;
+                }
+            }
+        } catch (SQLException ex) {
+            if (ex.getMessage() != null && ex.getMessage().toLowerCase(Locale.ROOT).contains("rowid")) {
+                return false;
+            }
+            throw ex;
+        }
+        return updated;
+    }
+
+    private boolean updateSqliteColumnWithPrimaryKey(Connection connection, String table, String column,
+                                                     List<String> primaryKeys, MigrationConfig config,
+                                                     MigrationStats total) throws SQLException {
+        StringBuilder selectSql = new StringBuilder("SELECT ");
+        for (int i = 0; i < primaryKeys.size(); i++) {
+            if (i > 0) selectSql.append(", ");
+            selectSql.append('"').append(primaryKeys.get(i)).append('"');
+        }
+        selectSql.append(", \"").append(column).append("\" FROM \"").append(table).append("\" WHERE \"")
+                .append(column).append("\" IS NOT NULL");
+
+        StringBuilder updateSql = new StringBuilder("UPDATE \"").append(table).append("\" SET \"")
+                .append(column).append("\"=? WHERE ");
+        for (int i = 0; i < primaryKeys.size(); i++) {
+            if (i > 0) updateSql.append(" AND ");
+            updateSql.append('"').append(primaryKeys.get(i)).append("\"=?");
+        }
+
+        boolean updated = false;
+        try (Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery(selectSql.toString());
+             PreparedStatement update = connection.prepareStatement(updateSql.toString())) {
+            while (rs.next()) {
+                int index = 1;
+                Object[] pkValues = new Object[primaryKeys.size()];
+                for (int i = 0; i < primaryKeys.size(); i++) {
+                    pkValues[i] = rs.getObject(index++);
+                }
+                String value = rs.getString(index);
+                if (value == null) {
+                    continue;
+                }
+                String upgraded = upgradeString(value, total);
+                if (upgraded != null && !upgraded.equals(value)) {
+                    update.setString(1, upgraded);
+                    for (int i = 0; i < pkValues.length; i++) {
+                        update.setObject(2 + i, pkValues[i]);
+                    }
+                    update.executeUpdate();
+                    updated = true;
+                    total.dbCellsUpdated++;
+                }
+            }
+        }
+        return updated;
+    }
+
+    private List<String> listTables(Connection connection) throws SQLException {
+        List<String> tables = new ArrayList<>();
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")) {
+            while (rs.next()) {
+                tables.add(rs.getString(1));
+            }
+        }
+        return tables;
+    }
+
+    private TableSchema readSchema(Connection connection, String table) throws SQLException {
+        List<String> textColumns = new ArrayList<>();
+        List<String> primaryKeys = new ArrayList<>();
+        boolean hasRowId = true;
+        String pragma = "PRAGMA table_info(\"" + table + "\")";
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(pragma)) {
+            while (rs.next()) {
+                String column = rs.getString("name");
+                String type = rs.getString("type");
+                int pk = rs.getInt("pk");
+                if (pk > 0) {
+                    primaryKeys.add(column);
+                }
+                if (type != null) {
+                    String upper = type.toUpperCase(Locale.ROOT);
+                    if (upper.contains("CHAR") || upper.contains("TEXT") || upper.contains("CLOB")) {
+                        textColumns.add(column);
+                    }
+                }
+            }
+        }
+        try (Statement stmt = connection.createStatement()) {
+            stmt.executeQuery("SELECT rowid FROM \"" + table + "\" LIMIT 1");
+        } catch (SQLException ex) {
+            hasRowId = false;
+        }
+        return new TableSchema(textColumns, primaryKeys, hasRowId);
+    }
+
+    private boolean upgradeSection(ConfigurationSection section, MigrationStats stats) {
+        boolean changed = false;
+        for (String key : section.getKeys(false)) {
+            Object value = section.get(key);
+            if (value instanceof ConfigurationSection nested) {
+                if (upgradeSection(nested, stats)) {
+                    changed = true;
+                }
+                continue;
+            }
+            Object updated = upgradeObject(value, stats);
+            if (updated != value && !Objects.equals(updated, value)) {
+                section.set(key, updated);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    private Object upgradeObject(Object value, MigrationStats stats) {
+        if (value instanceof String text) {
+            return upgradeString(text, stats);
+        }
+        if (value instanceof ItemStack item) {
+            return upgradeItemStack(item, stats);
+        }
+        if (value instanceof NbtItemStack nbtItem) {
+            ItemStack upgraded = upgradeItemStack(nbtItem.it, stats);
+            if (upgraded != nbtItem.it) {
+                nbtItem.it = upgraded;
+            }
+            return nbtItem;
+        }
+        if (value instanceof Map<?, ?> map) {
+            return upgradeMap(map, stats);
+        }
+        if (value instanceof List<?> list) {
+            return upgradeList(list, stats);
+        }
+        return value;
+    }
+
+    private Object upgradeMap(Map<?, ?> map, MigrationStats stats) {
+        boolean changed = false;
+        Map<Object, Object> updated = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            Object key = entry.getKey();
+            Object value = entry.getValue();
+            Object newValue = upgradeObject(value, stats);
+            if (newValue != value && !Objects.equals(newValue, value)) {
+                changed = true;
+            }
+            updated.put(key, newValue);
+        }
+        return changed ? updated : map;
+    }
+
+    private Object upgradeList(List<?> list, MigrationStats stats) {
+        boolean changed = false;
+        List<Object> updated = new ArrayList<>(list.size());
+        for (Object entry : list) {
+            Object newValue = upgradeObject(entry, stats);
+            if (newValue != entry && !Objects.equals(newValue, entry)) {
+                changed = true;
+            }
+            updated.add(newValue);
+        }
+        return changed ? updated : list;
+    }
+
+    private String upgradeString(String text, MigrationStats stats) {
+        if (text == null || text.isEmpty() || "<null>".equalsIgnoreCase(text)) {
+            return text;
+        }
+        String trimmed = text.trim();
+        if (looksLikeNbt(trimmed)) {
+            String updated = upgradeEntityNbt(trimmed, stats);
+            return updated == null ? text : updated;
+        }
+        String updated = upgradeBase64Item(trimmed, stats);
+        return updated == null ? text : updated;
+    }
+
+    private ItemStack upgradeItemStack(ItemStack item, MigrationStats stats) {
+        if (item == null || item.isEmpty()) {
+            return item;
+        }
+        try {
+            byte[] raw = ItemStackUtils.itemToBinary(item);
+            ItemStack upgraded = ItemStackUtils.itemFromBinary(raw);
+            if (upgraded == null) {
+                return item;
+            }
+            byte[] upgradedRaw = ItemStackUtils.itemToBinary(upgraded);
+            if (!Arrays.equals(raw, upgradedRaw)) {
+                stats.itemStackUpdated++;
+                return upgraded;
+            }
+        } catch (Exception ignored) {
+            // Leave item as-is if it cannot be re-encoded.
+        }
+        return item;
+    }
+
+    private String upgradeBase64Item(String base64, MigrationStats stats) {
+        if (base64.length() < 16 || !BASE64_PATTERN.matcher(base64).matches()) {
+            return null;
+        }
+        try {
+            ItemStack item = ItemStackUtils.itemFromBase64(base64);
+            if (item == null) {
+                return null;
+            }
+            String updated = ItemStackUtils.itemToBase64(item);
+            if (!updated.equals(base64)) {
+                stats.base64Updated++;
+                return updated;
+            }
+        } catch (Exception ignored) {
+            return null;
+        }
+        return null;
+    }
+
+    private String upgradeEntityNbt(String nbt, MigrationStats stats) {
+        try {
+            CompoundTag tag = TagParser.parseCompoundFully(nbt);
+            AtomicBoolean changed = new AtomicBoolean(false);
+            Tag upgraded = upgradeItemTags(tag, changed);
+            if (!changed.get() || !(upgraded instanceof CompoundTag)) {
+                return null;
+            }
+            stats.entityNbtUpdated++;
+            return upgraded.toString();
+        } catch (CommandSyntaxException | RuntimeException ex) {
+            return null;
+        }
+    }
+
+    private Tag upgradeItemTags(Tag tag, AtomicBoolean changed) {
+        if (tag instanceof CompoundTag compound) {
+            if (isItemStackCompound(compound)) {
+                CompoundTag upgraded = upgradeItemStackTag(compound);
+                if (!upgraded.equals(compound)) {
+                    changed.set(true);
+                }
+                return upgraded;
+            }
+            for (String key : compound.keySet()) {
+                Tag child = compound.get(key);
+                if (child == null) {
+                    continue;
+                }
+                Tag upgradedChild = upgradeItemTags(child, changed);
+                if (upgradedChild != child && !Objects.equals(upgradedChild, child)) {
+                    compound.put(key, upgradedChild);
+                }
+            }
+            return compound;
+        }
+        if (tag instanceof ListTag list) {
+            for (int i = 0; i < list.size(); i++) {
+                Tag child = list.get(i);
+                Tag upgradedChild = upgradeItemTags(child, changed);
+                if (upgradedChild != child && !Objects.equals(upgradedChild, child)) {
+                    list.set(i, upgradedChild);
+                }
+            }
+            return list;
+        }
+        return tag;
+    }
+
+    private CompoundTag upgradeItemStackTag(CompoundTag tag) {
+        int dataVersion = tag.getInt("DataVersion").orElse(DEFAULT_ITEMSTACK_DATA_VERSION);
+        boolean hadDataVersion = tag.get("DataVersion") != null;
+        if (hadDataVersion && dataVersion >= currentDataVersion) {
+            return tag;
+        }
+        DataFixer dataFixer = DataFixers.getDataFixer();
+        Dynamic<Tag> dynamic = new Dynamic<>(NbtOps.INSTANCE, tag);
+        dynamic = dataFixer.update(References.ITEM_STACK, dynamic, dataVersion, currentDataVersion);
+        CompoundTag updated = (CompoundTag) dynamic.getValue();
+        if (hadDataVersion) {
+            updated.putInt("DataVersion", currentDataVersion);
+        } else if (updated.get("DataVersion") != null) {
+            updated.remove("DataVersion");
+        }
+        return updated;
+    }
+
+    private boolean isItemStackCompound(CompoundTag tag) {
+        return tag.get("id") != null && tag.get("Count") != null;
+    }
+
+    private boolean looksLikeNbt(String text) {
+        return text.startsWith("{") && text.endsWith("}") && text.length() > 2;
+    }
+
+    private boolean isYamlFile(String name) {
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".yml") || lower.endsWith(".yaml");
+    }
+
+    private boolean isExcluded(Path file, Path root, Set<String> excludes) {
+        Path relative = root.relativize(file);
+        for (Path part : relative) {
+            if (excludes.contains(part.toString().toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void backupFile(Path file, Path targetRoot, MigrationConfig config) throws IOException {
+        if (!config.backupEnabled) {
+            return;
+        }
+        if (config.backupDirectory == null || config.backupDirectory.isEmpty()) {
+            Path backup = file.resolveSibling(file.getFileName().toString() + config.backupSuffix);
+            Files.copy(file, backup, StandardCopyOption.REPLACE_EXISTING);
+            return;
+        }
+        Path backupRoot = getDataFolder().toPath().resolve(config.backupDirectory);
+        Path relative = targetRoot.relativize(file);
+        Path backup = backupRoot.resolve(targetRoot.getFileName().toString()).resolve(relative);
+        Files.createDirectories(backup.getParent());
+        if (config.backupSuffix != null && !config.backupSuffix.isEmpty()) {
+            backup = backup.resolveSibling(backup.getFileName().toString() + config.backupSuffix);
+        }
+        Files.copy(file, backup, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    private static class MigrationConfig {
+        final List<String> targets;
+        final Set<String> excludeDirs;
+        final boolean backupEnabled;
+        final String backupDirectory;
+        final String backupSuffix;
+        final boolean dryRun;
+        final boolean disableAfterRun;
+        final boolean sqliteEnabled;
+        final List<java.nio.file.PathMatcher> sqliteMatchers;
+        final Set<String> sqliteExcludeTables;
+        final Set<String> sqliteExcludeColumns;
+
+        private MigrationConfig(List<String> targets, Set<String> excludeDirs, boolean backupEnabled,
+                                String backupDirectory, String backupSuffix, boolean dryRun, boolean disableAfterRun,
+                                boolean sqliteEnabled, List<java.nio.file.PathMatcher> sqliteMatchers,
+                                Set<String> sqliteExcludeTables, Set<String> sqliteExcludeColumns) {
+            this.targets = targets;
+            this.excludeDirs = excludeDirs;
+            this.backupEnabled = backupEnabled;
+            this.backupDirectory = backupDirectory;
+            this.backupSuffix = backupSuffix == null ? "" : backupSuffix;
+            this.dryRun = dryRun;
+            this.disableAfterRun = disableAfterRun;
+            this.sqliteEnabled = sqliteEnabled;
+            this.sqliteMatchers = sqliteMatchers;
+            this.sqliteExcludeTables = sqliteExcludeTables;
+            this.sqliteExcludeColumns = sqliteExcludeColumns;
+        }
+
+        static MigrationConfig from(JavaPlugin plugin) {
+            List<String> targets = plugin.getConfig().getStringList("targets");
+            if (targets == null || targets.isEmpty()) {
+                targets = Collections.emptyList();
+            }
+            List<String> excludes = plugin.getConfig().getStringList("excludeDirs");
+            Set<String> excludeDirs = new HashSet<>();
+            for (String entry : excludes) {
+                if (entry != null && !entry.isEmpty()) {
+                    excludeDirs.add(entry.toLowerCase(Locale.ROOT));
+                }
+            }
+            ConfigurationSection backup = plugin.getConfig().getConfigurationSection("backup");
+            boolean backupEnabled = backup == null || backup.getBoolean("enabled", true);
+            String backupDirectory = backup == null ? "backup" : backup.getString("directory", "backup");
+            String backupSuffix = backup == null ? ".bak" : backup.getString("suffix", ".bak");
+            boolean dryRun = plugin.getConfig().getBoolean("dryRun", false);
+            boolean disableAfterRun = plugin.getConfig().getBoolean("disableAfterRun", true);
+            ConfigurationSection sqlite = plugin.getConfig().getConfigurationSection("sqlite");
+            boolean sqliteEnabled = sqlite == null || sqlite.getBoolean("enabled", true);
+            List<String> includePatterns = sqlite == null ? Collections.singletonList("*.db") : sqlite.getStringList("includePatterns");
+            if (includePatterns == null || includePatterns.isEmpty()) {
+                includePatterns = Collections.singletonList("*.db");
+            }
+            List<java.nio.file.PathMatcher> matchers = new ArrayList<>();
+            for (String pattern : includePatterns) {
+                if (pattern != null && !pattern.isBlank()) {
+                    matchers.add(FileSystems.getDefault().getPathMatcher("glob:" + pattern));
+                }
+            }
+            Set<String> excludeTables = new HashSet<>();
+            Set<String> excludeColumns = new HashSet<>();
+            if (sqlite != null) {
+                for (String entry : sqlite.getStringList("excludeTables")) {
+                    if (entry != null && !entry.isBlank()) {
+                        excludeTables.add(normalizeIdentifier(entry));
+                    }
+                }
+                for (String entry : sqlite.getStringList("excludeColumns")) {
+                    if (entry != null && !entry.isBlank()) {
+                        excludeColumns.add(normalizeIdentifier(entry));
+                    }
+                }
+            }
+            return new MigrationConfig(targets, excludeDirs, backupEnabled, backupDirectory, backupSuffix,
+                    dryRun, disableAfterRun, sqliteEnabled, matchers, excludeTables, excludeColumns);
+        }
+    }
+
+    private static class MigrationStats {
+        int filesScanned;
+        int filesUpdated;
+        int base64Updated;
+        int itemStackUpdated;
+        int entityNbtUpdated;
+        int dbFilesScanned;
+        int dbFilesUpdated;
+        int dbCellsUpdated;
+        int errors;
+
+        void merge(MigrationStats other) {
+            base64Updated += other.base64Updated;
+            itemStackUpdated += other.itemStackUpdated;
+            entityNbtUpdated += other.entityNbtUpdated;
+            dbFilesScanned += other.dbFilesScanned;
+            dbFilesUpdated += other.dbFilesUpdated;
+            dbCellsUpdated += other.dbCellsUpdated;
+            errors += other.errors;
+        }
+    }
+
+    private static class TableSchema {
+        final List<String> textColumns;
+        final List<String> primaryKeys;
+        final boolean hasRowId;
+
+        private TableSchema(List<String> textColumns, List<String> primaryKeys, boolean hasRowId) {
+            this.textColumns = textColumns;
+            this.primaryKeys = primaryKeys;
+            this.hasRowId = hasRowId;
+        }
+    }
+
+    private static String normalizeIdentifier(String value) {
+        return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+    }
+}

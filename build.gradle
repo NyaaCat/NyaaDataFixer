@@ -1,0 +1,57 @@
+plugins {
+    id 'java'
+    id 'maven-publish'
+    id 'io.papermc.paperweight.userdev' version '2.0.0-beta.17'
+}
+
+group = 'cat.nyaa'
+archivesBaseName = 'NyaaDataFixer'
+version = '1.0-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name 'Paper'
+        url 'https://repo.papermc.io/repository/maven-public/'
+    }
+    maven {
+        name 'NyaaCat'
+        url 'https://ci.nyaacat.com/maven/'
+    }
+}
+
+configurations {
+    shade
+    implementation.extendsFrom shade
+}
+
+dependencies {
+    paperweight.paperDevBundle("1.21.11-R0.1-SNAPSHOT")
+    compileOnly "cat.nyaa:nyaacore:9.10"
+    shade "org.xerial:sqlite-jdbc:3.46.0.0"
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = "UTF-8"
+}
+
+processResources {
+    filesMatching("**/plugin.yml") {
+        expand 'version': project.version
+    }
+}
+
+
+jar {
+    from {
+        configurations.shade.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+}

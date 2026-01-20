@@ -1,0 +1,28 @@
+targets:
+  - NyaaPlayerCoser
+  - Saika
+  - Fusion
+  - InfiniteInfernal
+  - RPGItems
+  - RPGItems-ext-minion
+
+excludeDirs:
+  - lang
+  - language
+  - locale
+  - i18n
+
+backup:
+  enabled: true
+  directory: backup
+  suffix: ".bak"
+
+dryRun: false
+disableAfterRun: true
+
+sqlite:
+  enabled: true
+  includePatterns:
+    - "*.db"
+  excludeTables: []
+  excludeColumns: []
