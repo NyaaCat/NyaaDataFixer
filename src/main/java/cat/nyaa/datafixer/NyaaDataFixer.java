@@ -415,6 +415,10 @@ public class NyaaDataFixer extends JavaPlugin {
             return text;
         }
         String trimmed = text.trim();
+        String normalized = normalizeJsonComponentText(trimmed);
+        if (normalized != null) {
+            return normalized;
+        }
         if (looksLikeNbt(trimmed)) {
             String updated = upgradeEntityNbt(trimmed, stats);
             return updated == null ? text : updated;
@@ -500,6 +504,9 @@ public class NyaaDataFixer extends JavaPlugin {
                 if (upgradedChild != child && !Objects.equals(upgradedChild, child)) {
                     compound.put(key, upgradedChild);
                 }
+            }
+            if (normalizeEntityEquipment(compound)) {
+                changed.set(true);
             }
             return compound;
         }
@@ -603,6 +610,46 @@ public class NyaaDataFixer extends JavaPlugin {
             return numericTag.floatValue();
         }
         return null;
+    }
+
+    private boolean normalizeEntityEquipment(CompoundTag tag) {
+        boolean updated = false;
+        CompoundTag equipment = tag.get("equipment") instanceof CompoundTag existing ? existing : new CompoundTag();
+        Tag armorTag = tag.get("ArmorItems");
+        if (armorTag instanceof ListTag armorItems) {
+            updated |= putEquipmentSlot(equipment, "feet", armorItems, 0);
+            updated |= putEquipmentSlot(equipment, "legs", armorItems, 1);
+            updated |= putEquipmentSlot(equipment, "chest", armorItems, 2);
+            updated |= putEquipmentSlot(equipment, "head", armorItems, 3);
+            tag.remove("ArmorItems");
+            updated = true;
+        }
+        Tag handTag = tag.get("HandItems");
+        if (handTag instanceof ListTag handItems) {
+            updated |= putEquipmentSlot(equipment, "mainhand", handItems, 0);
+            updated |= putEquipmentSlot(equipment, "offhand", handItems, 1);
+            tag.remove("HandItems");
+            updated = true;
+        }
+        if (updated && !equipment.isEmpty()) {
+            tag.put("equipment", equipment);
+        }
+        return updated;
+    }
+
+    private boolean putEquipmentSlot(CompoundTag equipment, String key, ListTag list, int index) {
+        if (equipment.contains(key)) {
+            return false;
+        }
+        if (index >= list.size()) {
+            return false;
+        }
+        Tag entry = list.get(index);
+        if (entry instanceof CompoundTag compound && !compound.isEmpty()) {
+            equipment.put(key, compound);
+            return true;
+        }
+        return false;
     }
 
     private boolean looksLikeNbt(String text) {
@@ -840,7 +887,7 @@ public class NyaaDataFixer extends JavaPlugin {
         if (raw == null || raw.isBlank()) {
             return null;
         }
-        String trimmed = raw.trim();
+        String trimmed = stripWrappedQuotes(raw.trim());
         if (looksLikeJsonComponent(trimmed)) {
             try {
                 Component parsed = GsonComponentSerializer.gson().deserialize(trimmed);
@@ -859,11 +906,26 @@ public class NyaaDataFixer extends JavaPlugin {
         return null;
     }
 
+    private String stripWrappedQuotes(String value) {
+        if (value == null || value.length() < 2) {
+            return value;
+        }
+        char first = value.charAt(0);
+        char last = value.charAt(value.length() - 1);
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            return value.substring(1, value.length() - 1);
+        }
+        return value;
+    }
+
     private boolean looksLikeJsonComponent(String text) {
         if (text == null) {
             return false;
         }
         String trimmed = text.trim();
+        if (!(trimmed.startsWith("{\"") || trimmed.startsWith("["))) {
+            return false;
+        }
         if ((trimmed.startsWith("{") && trimmed.endsWith("}"))
                 || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
             return trimmed.contains("\"text\"")
@@ -877,6 +939,18 @@ public class NyaaDataFixer extends JavaPlugin {
                     || trimmed.contains("\"obfuscated\"");
         }
         return false;
+    }
+
+    private String normalizeJsonComponentText(String value) {
+        if (!looksLikeJsonComponent(value)) {
+            return null;
+        }
+        try {
+            Component parsed = GsonComponentSerializer.gson().deserialize(value);
+            return PlainTextComponentSerializer.plainText().serialize(parsed);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private boolean containsLegacyCodes(String text) {
