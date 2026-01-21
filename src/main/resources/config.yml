@@ -19,6 +19,8 @@ backup:
 
 dryRun: false
 disableAfterRun: true
+logUpdatedItemNames: false
+logUpdatedItemNamesLimit: 200
 
 sqlite:
   enabled: true

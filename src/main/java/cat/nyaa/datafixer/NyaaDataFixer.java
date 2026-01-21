@@ -6,10 +6,13 @@ import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.datafixers.DataFixer;
 import com.mojang.serialization.Dynamic;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.FloatTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.NumericTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.nbt.TagParser;
+import net.minecraft.resources.RegistryOps;
 import net.minecraft.util.datafix.DataFixers;
 import net.minecraft.util.datafix.fixes.References;
 import org.bukkit.Bukkit;
@@ -17,7 +20,14 @@ import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.craftbukkit.CraftServer;
+import org.bukkit.craftbukkit.inventory.CraftItemStack;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
+import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 
 import java.io.File;
 import java.io.IOException;
@@ -36,6 +46,10 @@ public class NyaaDataFixer extends JavaPlugin {
     private static final Pattern BASE64_PATTERN = Pattern.compile("^[A-Za-z0-9+/=]+$");
 
     private int currentDataVersion;
+    private boolean logUpdatedItemNames;
+    private int logUpdatedItemNamesRemaining;
+    private String currentContext;
+    private RegistryOps<Tag> registryOps;
 
     @Override
     public void onEnable() {
@@ -43,6 +57,8 @@ public class NyaaDataFixer extends JavaPlugin {
         currentDataVersion = Bukkit.getUnsafe().getDataVersion();
 
         MigrationConfig config = MigrationConfig.from(this);
+        logUpdatedItemNames = config.logUpdatedItemNames;
+        logUpdatedItemNamesRemaining = config.logUpdatedItemNamesLimit;
         MigrationStats total = new MigrationStats();
 
         Path pluginsDir = getServer().getPluginsFolder().toPath();
@@ -91,7 +107,14 @@ public class NyaaDataFixer extends JavaPlugin {
         }
 
         MigrationStats fileStats = new MigrationStats();
-        boolean changed = upgradeSection(yaml, fileStats);
+        String previousContext = currentContext;
+        currentContext = formatContext(file, targetDir);
+        boolean changed;
+        try {
+            changed = upgradeSection(yaml, fileStats);
+        } finally {
+            currentContext = previousContext;
+        }
         if (!changed) {
             return;
         }
@@ -160,7 +183,13 @@ public class NyaaDataFixer extends JavaPlugin {
                         if (config.sqliteExcludeColumns.contains(normalizeIdentifier(column))) {
                             continue;
                         }
-                        updated |= updateSqliteColumn(connection, table, column, schema, config, total);
+                        String previousContext = currentContext;
+                        currentContext = formatContext(dbFile, targetDir) + "#" + table + "." + column;
+                        try {
+                            updated |= updateSqliteColumn(connection, table, column, schema, config, total);
+                        } finally {
+                            currentContext = previousContext;
+                        }
                     }
                 }
                 if (updated && !config.dryRun) {
@@ -337,11 +366,12 @@ public class NyaaDataFixer extends JavaPlugin {
             return upgradeItemStack(item, stats);
         }
         if (value instanceof NbtItemStack nbtItem) {
-            ItemStack upgraded = upgradeItemStack(nbtItem.it, stats);
-            if (upgraded != nbtItem.it) {
-                nbtItem.it = upgraded;
+            if (nbtItem.it == null) {
+                return nbtItem;
             }
-            return nbtItem;
+            ItemStack upgraded = upgradeItemStack(nbtItem.it, stats);
+            // Force reserialization so base64 gets rewritten with the new format.
+            return new NbtItemStack(upgraded);
         }
         if (value instanceof Map<?, ?> map) {
             return upgradeMap(map, stats);
@@ -404,8 +434,13 @@ public class NyaaDataFixer extends JavaPlugin {
                 return item;
             }
             byte[] upgradedRaw = ItemStackUtils.itemToBinary(upgraded);
-            if (!Arrays.equals(raw, upgradedRaw)) {
+            boolean changed = !Arrays.equals(raw, upgradedRaw);
+            if (normalizeItemText(upgraded)) {
+                changed = true;
+            }
+            if (changed) {
                 stats.itemStackUpdated++;
+                logUpdatedItemName(upgraded);
                 return upgraded;
             }
         } catch (Exception ignored) {
@@ -423,9 +458,11 @@ public class NyaaDataFixer extends JavaPlugin {
             if (item == null) {
                 return null;
             }
+            boolean changed = normalizeItemText(item);
             String updated = ItemStackUtils.itemToBase64(item);
-            if (!updated.equals(base64)) {
+            if (!updated.equals(base64) || changed) {
                 stats.base64Updated++;
+                logUpdatedItemName(item);
                 return updated;
             }
         } catch (Exception ignored) {
@@ -452,11 +489,7 @@ public class NyaaDataFixer extends JavaPlugin {
     private Tag upgradeItemTags(Tag tag, AtomicBoolean changed) {
         if (tag instanceof CompoundTag compound) {
             if (isItemStackCompound(compound)) {
-                CompoundTag upgraded = upgradeItemStackTag(compound);
-                if (!upgraded.equals(compound)) {
-                    changed.set(true);
-                }
-                return upgraded;
+                return upgradeItemStackTag(compound, changed);
             }
             for (String key : compound.keySet()) {
                 Tag child = compound.get(key);
@@ -483,10 +516,28 @@ public class NyaaDataFixer extends JavaPlugin {
         return tag;
     }
 
-    private CompoundTag upgradeItemStackTag(CompoundTag tag) {
+    private CompoundTag upgradeItemStackTag(CompoundTag tag, AtomicBoolean changed) {
         int dataVersion = tag.getInt("DataVersion").orElse(DEFAULT_ITEMSTACK_DATA_VERSION);
         boolean hadDataVersion = tag.get("DataVersion") != null;
         if (hadDataVersion && dataVersion >= currentDataVersion) {
+            return tag;
+        }
+        boolean hasComponents = tag.get("components") instanceof CompoundTag;
+        boolean hasLegacyTag = tag.get("tag") != null;
+        boolean itemChanged = false;
+        // Avoid running DataFixer on already-modern component-based stacks without a DataVersion,
+        // otherwise it can clobber custom_model_data and other component values.
+        if (!hadDataVersion && hasComponents && !hasLegacyTag) {
+            itemChanged = normalizeCustomModelData(tag);
+            CompoundTag normalized = normalizeItemText(tag, hadDataVersion);
+            if (normalized != null) {
+                tag = normalized;
+                itemChanged = true;
+            }
+            if (itemChanged) {
+                changed.set(true);
+                logUpdatedItemName(tag);
+            }
             return tag;
         }
         DataFixer dataFixer = DataFixers.getDataFixer();
@@ -498,11 +549,60 @@ public class NyaaDataFixer extends JavaPlugin {
         } else if (updated.get("DataVersion") != null) {
             updated.remove("DataVersion");
         }
+        if (!updated.equals(tag)) {
+            itemChanged = true;
+        }
+        if (normalizeCustomModelData(updated)) {
+            itemChanged = true;
+        }
+        CompoundTag normalized = normalizeItemText(updated, hadDataVersion);
+        if (normalized != null) {
+            updated = normalized;
+            itemChanged = true;
+        }
+        if (itemChanged) {
+            changed.set(true);
+            logUpdatedItemName(updated);
+        }
         return updated;
     }
 
     private boolean isItemStackCompound(CompoundTag tag) {
-        return tag.get("id") != null && tag.get("Count") != null;
+        return tag.get("id") != null && (tag.get("Count") != null || tag.get("count") != null);
+    }
+
+    private boolean normalizeCustomModelData(CompoundTag tag) {
+        Tag componentsTag = tag.get("components");
+        if (!(componentsTag instanceof CompoundTag components)) {
+            return false;
+        }
+        Tag cmdTag = components.get("minecraft:custom_model_data");
+        if (cmdTag == null) {
+            return false;
+        }
+        if (cmdTag instanceof CompoundTag compound) {
+            Tag floats = compound.get("floats");
+            if (floats instanceof ListTag) {
+                return false;
+            }
+        }
+        Float value = readNumericTag(cmdTag);
+        if (value == null) {
+            return false;
+        }
+        ListTag floats = new ListTag();
+        floats.add(FloatTag.valueOf(value));
+        CompoundTag normalized = new CompoundTag();
+        normalized.put("floats", floats);
+        components.put("minecraft:custom_model_data", normalized);
+        return true;
+    }
+
+    private Float readNumericTag(Tag tag) {
+        if (tag instanceof NumericTag numericTag) {
+            return numericTag.floatValue();
+        }
+        return null;
     }
 
     private boolean looksLikeNbt(String text) {
@@ -543,6 +643,255 @@ public class NyaaDataFixer extends JavaPlugin {
         Files.copy(file, backup, StandardCopyOption.REPLACE_EXISTING);
     }
 
+    private void logUpdatedItemName(ItemStack item) {
+        if (!logUpdatedItemNames || logUpdatedItemNamesRemaining <= 0) {
+            return;
+        }
+        String name = extractCustomItemName(item);
+        if (name == null || name.isBlank()) {
+            return;
+        }
+        StringBuilder message = new StringBuilder("Updated item name");
+        if (currentContext != null) {
+            message.append(" in ").append(currentContext);
+        }
+        message.append(": ").append(sanitizeLogValue(name));
+        getLogger().info(message.toString());
+        logUpdatedItemNamesRemaining--;
+    }
+
+    private void logUpdatedItemName(CompoundTag tag) {
+        if (!logUpdatedItemNames || logUpdatedItemNamesRemaining <= 0) {
+            return;
+        }
+        ItemStack item = itemStackFromTag(tag);
+        if (item != null) {
+            logUpdatedItemName(item);
+        }
+    }
+
+    private ItemStack itemStackFromTag(CompoundTag tag) {
+        try {
+            RegistryOps<Tag> ops = getRegistryOps();
+            var result = net.minecraft.world.item.ItemStack.CODEC.parse(ops, tag);
+            var nms = result.result().orElse(null);
+            if (nms == null) {
+                return null;
+            }
+            return CraftItemStack.asBukkitCopy(nms);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private CompoundTag itemStackToTag(ItemStack item) {
+        try {
+            RegistryOps<Tag> ops = getRegistryOps();
+            var nms = CraftItemStack.asNMSCopy(item);
+            var result = net.minecraft.world.item.ItemStack.CODEC.encodeStart(ops, nms);
+            Tag value = result.result().orElse(null);
+            if (value instanceof CompoundTag compound) {
+                return compound;
+            }
+        } catch (Exception ignored) {
+            // Ignore serialization errors.
+        }
+        return null;
+    }
+
+    private RegistryOps<Tag> getRegistryOps() {
+        if (registryOps == null) {
+            CraftServer server = (CraftServer) Bukkit.getServer();
+            registryOps = RegistryOps.create(NbtOps.INSTANCE, server.getServer().registryAccess());
+        }
+        return registryOps;
+    }
+
+    private String extractCustomItemName(ItemStack item) {
+        if (item == null || item.isEmpty()) {
+            return null;
+        }
+        if (!item.hasItemMeta()) {
+            return null;
+        }
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null) {
+            return null;
+        }
+        Component component = null;
+        if (meta.hasCustomName()) {
+            component = meta.customName();
+        } else if (meta.hasDisplayName()) {
+            component = meta.displayName();
+        }
+        if (component != null) {
+            String plain = PlainTextComponentSerializer.plainText().serialize(component);
+            if (plain != null && !plain.isBlank()) {
+                return plain;
+            }
+        }
+        if (meta.hasDisplayName()) {
+            String legacy = meta.getDisplayName();
+            if (legacy != null && !legacy.isBlank()) {
+                return legacy;
+            }
+        }
+        return null;
+    }
+
+    private boolean normalizeItemText(ItemStack item) {
+        if (item == null || item.isEmpty() || !item.hasItemMeta()) {
+            return false;
+        }
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null) {
+            return false;
+        }
+        boolean changed = false;
+        boolean hasCustomName = meta.hasCustomName();
+        if (hasCustomName) {
+            Component current = meta.customName();
+            if (current != null) {
+                String plain = PlainTextComponentSerializer.plainText().serialize(current);
+                Component parsed = parseTextComponent(plain);
+                if (parsed != null && !parsed.equals(current)) {
+                    meta.displayName(parsed);
+                    changed = true;
+                }
+            }
+        }
+        if (!hasCustomName && meta.hasDisplayName()) {
+            String legacy = meta.getDisplayName();
+            Component parsed = parseTextComponent(legacy);
+            if (parsed != null) {
+                Component current = meta.displayName();
+                if (current == null || !current.equals(parsed)) {
+                    meta.displayName(parsed);
+                    changed = true;
+                }
+            }
+        }
+        List<Component> loreComponents = meta.lore();
+        if (loreComponents != null && !loreComponents.isEmpty()) {
+            boolean needsNormalize = false;
+            List<Component> normalized = new ArrayList<>(loreComponents.size());
+            for (Component line : loreComponents) {
+                String plain = PlainTextComponentSerializer.plainText().serialize(line);
+                Component parsed = parseTextComponent(plain);
+                if (parsed != null) {
+                    needsNormalize = true;
+                    normalized.add(parsed);
+                } else {
+                    normalized.add(line);
+                }
+            }
+            if (needsNormalize) {
+                meta.lore(normalized);
+                changed = true;
+            }
+        } else if (meta.hasLore()) {
+            List<String> lore = meta.getLore();
+            if (lore != null && !lore.isEmpty()) {
+                boolean needsNormalize = false;
+                for (String line : lore) {
+                    if (looksLikeJsonComponent(line) || containsLegacyCodes(line)) {
+                        needsNormalize = true;
+                        break;
+                    }
+                }
+                if (needsNormalize) {
+                    List<Component> normalized = new ArrayList<>(lore.size());
+                    for (String line : lore) {
+                        Component parsed = parseTextComponent(line);
+                        normalized.add(parsed != null ? parsed : Component.text(line));
+                    }
+                    meta.lore(normalized);
+                    changed = true;
+                }
+            }
+        }
+        if (changed) {
+            item.setItemMeta(meta);
+        }
+        return changed;
+    }
+
+    private CompoundTag normalizeItemText(CompoundTag tag, boolean hadDataVersion) {
+        ItemStack item = itemStackFromTag(tag);
+        if (item == null) {
+            return null;
+        }
+        if (!normalizeItemText(item)) {
+            return null;
+        }
+        CompoundTag normalized = itemStackToTag(item);
+        if (normalized == null) {
+            return null;
+        }
+        if (hadDataVersion) {
+            normalized.putInt("DataVersion", currentDataVersion);
+        } else if (normalized.get("DataVersion") != null) {
+            normalized.remove("DataVersion");
+        }
+        return normalized;
+    }
+
+    private Component parseTextComponent(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (looksLikeJsonComponent(trimmed)) {
+            try {
+                Component parsed = GsonComponentSerializer.gson().deserialize(trimmed);
+                String plain = PlainTextComponentSerializer.plainText().serialize(parsed);
+                if (containsLegacyCodes(plain)) {
+                    return LegacyComponentSerializer.legacySection().deserialize(plain);
+                }
+                return parsed;
+            } catch (Exception ignored) {
+                // Fall back to legacy parsing below.
+            }
+        }
+        if (containsLegacyCodes(trimmed)) {
+            return LegacyComponentSerializer.legacySection().deserialize(trimmed);
+        }
+        return null;
+    }
+
+    private boolean looksLikeJsonComponent(String text) {
+        if (text == null) {
+            return false;
+        }
+        String trimmed = text.trim();
+        if ((trimmed.startsWith("{") && trimmed.endsWith("}"))
+                || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+            return trimmed.contains("\"text\"")
+                    || trimmed.contains("\"extra\"")
+                    || trimmed.contains("\"translate\"")
+                    || trimmed.contains("\"color\"")
+                    || trimmed.contains("\"bold\"")
+                    || trimmed.contains("\"italic\"")
+                    || trimmed.contains("\"underlined\"")
+                    || trimmed.contains("\"strikethrough\"")
+                    || trimmed.contains("\"obfuscated\"");
+        }
+        return false;
+    }
+
+    private boolean containsLegacyCodes(String text) {
+        return text != null && text.indexOf('§') >= 0;
+    }
+
+    private String sanitizeLogValue(String value) {
+        return value.replace("\n", "\\n").replace("\r", "\\r");
+    }
+
+    private String formatContext(Path file, Path targetDir) {
+        Path relative = targetDir.relativize(file);
+        return targetDir.getFileName() + "/" + relative.toString().replace(File.separatorChar, '/');
+    }
+
     private static class MigrationConfig {
         final List<String> targets;
         final Set<String> excludeDirs;
@@ -555,11 +904,14 @@ public class NyaaDataFixer extends JavaPlugin {
         final List<java.nio.file.PathMatcher> sqliteMatchers;
         final Set<String> sqliteExcludeTables;
         final Set<String> sqliteExcludeColumns;
+        final boolean logUpdatedItemNames;
+        final int logUpdatedItemNamesLimit;
 
         private MigrationConfig(List<String> targets, Set<String> excludeDirs, boolean backupEnabled,
                                 String backupDirectory, String backupSuffix, boolean dryRun, boolean disableAfterRun,
                                 boolean sqliteEnabled, List<java.nio.file.PathMatcher> sqliteMatchers,
-                                Set<String> sqliteExcludeTables, Set<String> sqliteExcludeColumns) {
+                                Set<String> sqliteExcludeTables, Set<String> sqliteExcludeColumns,
+                                boolean logUpdatedItemNames, int logUpdatedItemNamesLimit) {
             this.targets = targets;
             this.excludeDirs = excludeDirs;
             this.backupEnabled = backupEnabled;
@@ -571,6 +923,8 @@ public class NyaaDataFixer extends JavaPlugin {
             this.sqliteMatchers = sqliteMatchers;
             this.sqliteExcludeTables = sqliteExcludeTables;
             this.sqliteExcludeColumns = sqliteExcludeColumns;
+            this.logUpdatedItemNames = logUpdatedItemNames;
+            this.logUpdatedItemNamesLimit = Math.max(0, logUpdatedItemNamesLimit);
         }
 
         static MigrationConfig from(JavaPlugin plugin) {
@@ -617,8 +971,11 @@ public class NyaaDataFixer extends JavaPlugin {
                     }
                 }
             }
+            boolean logUpdatedItemNames = plugin.getConfig().getBoolean("logUpdatedItemNames", false);
+            int logUpdatedItemNamesLimit = plugin.getConfig().getInt("logUpdatedItemNamesLimit", 200);
             return new MigrationConfig(targets, excludeDirs, backupEnabled, backupDirectory, backupSuffix,
-                    dryRun, disableAfterRun, sqliteEnabled, matchers, excludeTables, excludeColumns);
+                    dryRun, disableAfterRun, sqliteEnabled, matchers, excludeTables, excludeColumns,
+                    logUpdatedItemNames, logUpdatedItemNamesLimit);
         }
     }
 
