@@ -887,7 +887,7 @@ public class NyaaDataFixer extends JavaPlugin {
                     for (String line : lore) {
                         Component parsed = parseTextComponent(line);
                         Component fallback = parsed != null ? parsed : Component.text(line);
-                        normalized.add(normalizeItalicIfUnset(fallback));
+                        normalized.add(normalizeDecorationsIfUnset(fallback));
                     }
                     meta.lore(normalized);
                     changed = true;
@@ -981,27 +981,30 @@ public class NyaaDataFixer extends JavaPlugin {
                 Component parsed = GsonComponentSerializer.gson().deserialize(trimmed);
                 String plain = PlainTextComponentSerializer.plainText().serialize(parsed);
                 if (containsLegacyCodes(plain)) {
-                    return normalizeItalicIfUnset(LegacyComponentSerializer.legacySection().deserialize(plain));
+                    return normalizeDecorationsIfUnset(LegacyComponentSerializer.legacySection().deserialize(plain));
                 }
-                return normalizeItalicIfUnset(parsed);
+                return normalizeDecorationsIfUnset(parsed);
             } catch (Exception ignored) {
                 // Fall back to legacy parsing below.
             }
         }
         if (containsLegacyCodes(trimmed)) {
-            return normalizeItalicIfUnset(LegacyComponentSerializer.legacySection().deserialize(trimmed));
+            return normalizeDecorationsIfUnset(LegacyComponentSerializer.legacySection().deserialize(trimmed));
         }
         return null;
     }
 
-    private Component normalizeItalicIfUnset(Component component) {
+    private Component normalizeDecorationsIfUnset(Component component) {
         if (component == null) {
             return null;
         }
-        if (component.decoration(TextDecoration.ITALIC) == TextDecoration.State.NOT_SET) {
-            return component.decoration(TextDecoration.ITALIC, TextDecoration.State.FALSE);
+        Component normalized = component;
+        for (TextDecoration decoration : TextDecoration.values()) {
+            if (normalized.decoration(decoration) == TextDecoration.State.NOT_SET) {
+                normalized = normalized.decoration(decoration, TextDecoration.State.FALSE);
+            }
         }
-        return component;
+        return normalized;
     }
 
     private String stripWrappedQuotes(String value) {
