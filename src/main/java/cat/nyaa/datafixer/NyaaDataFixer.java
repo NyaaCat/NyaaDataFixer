@@ -25,6 +25,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.craftbukkit.CraftServer;
 import org.bukkit.craftbukkit.inventory.CraftItemStack;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.TextComponent;
 import net.kyori.adventure.text.format.TextDecoration;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
@@ -1011,7 +1012,16 @@ public class NyaaDataFixer extends JavaPlugin {
 
     private Component normalizeComponent(Component component) {
         Component normalized = normalizeDecorationsIfUnset(component);
-        return normalized == null ? null : normalized.compact();
+        return normalized == null ? null : ensureExtraWrapper(normalized);
+    }
+
+    private Component ensureExtraWrapper(Component component) {
+        if (component instanceof TextComponent text) {
+            if (text.content().isEmpty() && !text.children().isEmpty()) {
+                return component;
+            }
+        }
+        return Component.text("").append(component);
     }
 
     private Component normalizeDecorationsIfUnset(Component component) {
