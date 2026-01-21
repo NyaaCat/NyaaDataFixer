@@ -25,6 +25,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.craftbukkit.CraftServer;
 import org.bukkit.craftbukkit.inventory.CraftItemStack;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.TextDecoration;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
@@ -885,7 +886,8 @@ public class NyaaDataFixer extends JavaPlugin {
                     List<Component> normalized = new ArrayList<>(lore.size());
                     for (String line : lore) {
                         Component parsed = parseTextComponent(line);
-                        normalized.add(parsed != null ? parsed : Component.text(line));
+                        Component fallback = parsed != null ? parsed : Component.text(line);
+                        normalized.add(normalizeItalicIfUnset(fallback));
                     }
                     meta.lore(normalized);
                     changed = true;
@@ -979,17 +981,27 @@ public class NyaaDataFixer extends JavaPlugin {
                 Component parsed = GsonComponentSerializer.gson().deserialize(trimmed);
                 String plain = PlainTextComponentSerializer.plainText().serialize(parsed);
                 if (containsLegacyCodes(plain)) {
-                    return LegacyComponentSerializer.legacySection().deserialize(plain);
+                    return normalizeItalicIfUnset(LegacyComponentSerializer.legacySection().deserialize(plain));
                 }
-                return parsed;
+                return normalizeItalicIfUnset(parsed);
             } catch (Exception ignored) {
                 // Fall back to legacy parsing below.
             }
         }
         if (containsLegacyCodes(trimmed)) {
-            return LegacyComponentSerializer.legacySection().deserialize(trimmed);
+            return normalizeItalicIfUnset(LegacyComponentSerializer.legacySection().deserialize(trimmed));
         }
         return null;
+    }
+
+    private Component normalizeItalicIfUnset(Component component) {
+        if (component == null) {
+            return null;
+        }
+        if (component.decoration(TextDecoration.ITALIC) == TextDecoration.State.NOT_SET) {
+            return component.decoration(TextDecoration.ITALIC, TextDecoration.State.FALSE);
+        }
+        return component;
     }
 
     private String stripWrappedQuotes(String value) {
