@@ -27,6 +27,7 @@ import org.bukkit.craftbukkit.inventory.CraftItemStack;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.TextComponent;
 import net.kyori.adventure.text.format.TextDecoration;
+import net.kyori.adventure.text.format.Style;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
@@ -1011,17 +1012,43 @@ public class NyaaDataFixer extends JavaPlugin {
     }
 
     private Component normalizeComponent(Component component) {
-        Component normalized = normalizeDecorationsIfUnset(component);
-        return normalized == null ? null : ensureExtraWrapper(normalized);
+        if (component == null) {
+            return null;
+        }
+        return ensureExtraWrapper(component);
     }
 
     private Component ensureExtraWrapper(Component component) {
+        List<Component> extras = new ArrayList<>();
+        flattenForExtra(component, Style.empty(), extras);
+        if (extras.isEmpty()) {
+            return Component.text("");
+        }
+        return Component.text("").append(extras);
+    }
+
+    private void flattenForExtra(Component component, Style parentStyle, List<Component> extras) {
+        if (component == null) {
+            return;
+        }
+        Style mergedStyle = component.style();
+        if (parentStyle != null) {
+            mergedStyle = mergedStyle.merge(parentStyle, Style.Merge.Strategy.IF_ABSENT_ON_TARGET);
+        }
         if (component instanceof TextComponent text) {
-            if (text.content().isEmpty() && !text.children().isEmpty()) {
-                return component;
+            if (!text.content().isEmpty()) {
+                Component leaf = Component.text(text.content()).style(mergedStyle);
+                extras.add(normalizeDecorationsIfUnset(leaf));
+            }
+        } else if (component.children().isEmpty()) {
+            Component leaf = component.style(mergedStyle).children(Collections.emptyList());
+            extras.add(normalizeDecorationsIfUnset(leaf));
+        }
+        if (!component.children().isEmpty()) {
+            for (Component child : component.children()) {
+                flattenForExtra(child, mergedStyle, extras);
             }
         }
-        return Component.text("").append(component);
     }
 
     private Component normalizeDecorationsIfUnset(Component component) {
