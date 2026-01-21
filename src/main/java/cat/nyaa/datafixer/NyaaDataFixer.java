@@ -431,26 +431,13 @@ public class NyaaDataFixer extends JavaPlugin {
         if (item == null || item.isEmpty()) {
             return item;
         }
-        try {
-            byte[] raw = ItemStackUtils.itemToBinary(item);
-            ItemStack upgraded = ItemStackUtils.itemFromBinary(raw);
-            if (upgraded == null) {
-                return item;
-            }
-            byte[] upgradedRaw = ItemStackUtils.itemToBinary(upgraded);
-            boolean changed = !Arrays.equals(raw, upgradedRaw);
-            if (normalizeItemText(upgraded)) {
-                changed = true;
-            }
-            if (changed) {
-                stats.itemStackUpdated++;
-                logUpdatedItemName(upgraded);
-                return upgraded;
-            }
-        } catch (Exception ignored) {
-            // Leave item as-is if it cannot be re-encoded.
+        AtomicBoolean changed = new AtomicBoolean(false);
+        ItemStack upgraded = upgradeItemStackInternal(item, changed);
+        if (!changed.get()) {
+            return item;
         }
-        return item;
+        stats.itemStackUpdated++;
+        return upgraded;
     }
 
     private String upgradeBase64Item(String base64, MigrationStats stats) {
@@ -462,11 +449,17 @@ public class NyaaDataFixer extends JavaPlugin {
             if (item == null) {
                 return null;
             }
-            boolean changed = normalizeItemText(item);
+            AtomicBoolean changed = new AtomicBoolean(false);
+            ItemStack upgraded = upgradeItemStackInternal(item, changed);
+            if (changed.get()) {
+                item = upgraded;
+            }
             String updated = ItemStackUtils.itemToBase64(item);
-            if (!updated.equals(base64) || changed) {
+            if (!updated.equals(base64) || changed.get()) {
                 stats.base64Updated++;
-                logUpdatedItemName(item);
+                if (!changed.get()) {
+                    logUpdatedItemName(item);
+                }
                 return updated;
             }
         } catch (Exception ignored) {
@@ -541,6 +534,9 @@ public class NyaaDataFixer extends JavaPlugin {
                 tag = normalized;
                 itemChanged = true;
             }
+            if (upgradeNestedItemTags(tag, changed)) {
+                itemChanged = true;
+            }
             if (itemChanged) {
                 changed.set(true);
                 logUpdatedItemName(tag);
@@ -567,11 +563,50 @@ public class NyaaDataFixer extends JavaPlugin {
             updated = normalized;
             itemChanged = true;
         }
+        if (upgradeNestedItemTags(updated, changed)) {
+            itemChanged = true;
+        }
         if (itemChanged) {
             changed.set(true);
             logUpdatedItemName(updated);
         }
         return updated;
+    }
+
+    private ItemStack upgradeItemStackInternal(ItemStack item, AtomicBoolean changed) {
+        CompoundTag tag = itemStackToTag(item);
+        if (tag != null) {
+            AtomicBoolean localChanged = new AtomicBoolean(false);
+            CompoundTag updated = upgradeItemStackTag(tag, localChanged);
+            if (localChanged.get()) {
+                ItemStack upgraded = itemStackFromTag(updated);
+                if (upgraded != null) {
+                    changed.set(true);
+                    return upgraded;
+                }
+            }
+            return item;
+        }
+        try {
+            byte[] raw = ItemStackUtils.itemToBinary(item);
+            ItemStack upgraded = ItemStackUtils.itemFromBinary(raw);
+            if (upgraded == null) {
+                return item;
+            }
+            byte[] upgradedRaw = ItemStackUtils.itemToBinary(upgraded);
+            boolean updated = !Arrays.equals(raw, upgradedRaw);
+            if (normalizeItemText(upgraded)) {
+                updated = true;
+            }
+            if (updated) {
+                changed.set(true);
+                logUpdatedItemName(upgraded);
+                return upgraded;
+            }
+        } catch (Exception ignored) {
+            // Leave item as-is if it cannot be re-encoded.
+        }
+        return item;
     }
 
     private boolean isItemStackCompound(CompoundTag tag) {
@@ -881,6 +916,57 @@ public class NyaaDataFixer extends JavaPlugin {
             normalized.remove("DataVersion");
         }
         return normalized;
+    }
+
+    private boolean upgradeNestedItemTags(CompoundTag tag, AtomicBoolean changed) {
+        CompoundTag before = tag.copy();
+        upgradeNestedItemTagsInternal(tag, changed);
+        return !before.equals(tag);
+    }
+
+    private void upgradeNestedItemTagsInternal(Tag tag, AtomicBoolean changed) {
+        if (tag instanceof CompoundTag compound) {
+            for (String key : compound.keySet()) {
+                Tag child = compound.get(key);
+                if (child == null) {
+                    continue;
+                }
+                if (child instanceof CompoundTag childCompound) {
+                    if (isItemStackCompound(childCompound)) {
+                        Tag upgradedChild = upgradeItemStackTag(childCompound, changed);
+                        if (upgradedChild != childCompound && !Objects.equals(upgradedChild, childCompound)) {
+                            compound.put(key, upgradedChild);
+                        }
+                    } else {
+                        upgradeNestedItemTagsInternal(childCompound, changed);
+                    }
+                    continue;
+                }
+                if (child instanceof ListTag list) {
+                    upgradeNestedItemTagsInternal(list, changed);
+                }
+            }
+            return;
+        }
+        if (tag instanceof ListTag list) {
+            for (int i = 0; i < list.size(); i++) {
+                Tag child = list.get(i);
+                if (child instanceof CompoundTag childCompound) {
+                    if (isItemStackCompound(childCompound)) {
+                        Tag upgradedChild = upgradeItemStackTag(childCompound, changed);
+                        if (upgradedChild != childCompound && !Objects.equals(upgradedChild, childCompound)) {
+                            list.set(i, upgradedChild);
+                        }
+                    } else {
+                        upgradeNestedItemTagsInternal(childCompound, changed);
+                    }
+                    continue;
+                }
+                if (child instanceof ListTag childList) {
+                    upgradeNestedItemTagsInternal(childList, changed);
+                }
+            }
+        }
     }
 
     private Component parseTextComponent(String raw) {
