@@ -835,10 +835,16 @@ public class NyaaDataFixer extends JavaPlugin {
         if (hasCustomName) {
             Component current = meta.customName();
             if (current != null) {
+                Component normalized = normalizeComponent(current);
+                if (normalized != null && !normalized.equals(current)) {
+                    meta.customName(normalized);
+                    current = normalized;
+                    changed = true;
+                }
                 String plain = PlainTextComponentSerializer.plainText().serialize(current);
                 Component parsed = parseTextComponent(plain);
                 if (parsed != null && !parsed.equals(current)) {
-                    meta.displayName(parsed);
+                    meta.customName(parsed);
                     changed = true;
                 }
             }
@@ -852,6 +858,15 @@ public class NyaaDataFixer extends JavaPlugin {
                     meta.displayName(parsed);
                     changed = true;
                 }
+            } else {
+                Component current = meta.displayName();
+                if (current != null) {
+                    Component normalized = normalizeComponent(current);
+                    if (normalized != null && !normalized.equals(current)) {
+                        meta.displayName(normalized);
+                        changed = true;
+                    }
+                }
             }
         }
         List<Component> loreComponents = meta.lore();
@@ -861,12 +876,12 @@ public class NyaaDataFixer extends JavaPlugin {
             for (Component line : loreComponents) {
                 String plain = PlainTextComponentSerializer.plainText().serialize(line);
                 Component parsed = parseTextComponent(plain);
-                if (parsed != null) {
+                Component target = parsed != null ? parsed : line;
+                Component compacted = normalizeComponent(target);
+                if (compacted != null && !compacted.equals(line)) {
                     needsNormalize = true;
-                    normalized.add(parsed);
-                } else {
-                    normalized.add(line);
                 }
+                normalized.add(compacted != null ? compacted : line);
             }
             if (needsNormalize) {
                 meta.lore(normalized);
@@ -887,7 +902,7 @@ public class NyaaDataFixer extends JavaPlugin {
                     for (String line : lore) {
                         Component parsed = parseTextComponent(line);
                         Component fallback = parsed != null ? parsed : Component.text(line);
-                        normalized.add(normalizeDecorationsIfUnset(fallback));
+                        normalized.add(normalizeComponent(fallback));
                     }
                     meta.lore(normalized);
                     changed = true;
@@ -981,17 +996,22 @@ public class NyaaDataFixer extends JavaPlugin {
                 Component parsed = GsonComponentSerializer.gson().deserialize(trimmed);
                 String plain = PlainTextComponentSerializer.plainText().serialize(parsed);
                 if (containsLegacyCodes(plain)) {
-                    return normalizeDecorationsIfUnset(LegacyComponentSerializer.legacySection().deserialize(plain));
+                    return normalizeComponent(LegacyComponentSerializer.legacySection().deserialize(plain));
                 }
-                return normalizeDecorationsIfUnset(parsed);
+                return normalizeComponent(parsed);
             } catch (Exception ignored) {
                 // Fall back to legacy parsing below.
             }
         }
         if (containsLegacyCodes(trimmed)) {
-            return normalizeDecorationsIfUnset(LegacyComponentSerializer.legacySection().deserialize(trimmed));
+            return normalizeComponent(LegacyComponentSerializer.legacySection().deserialize(trimmed));
         }
         return null;
+    }
+
+    private Component normalizeComponent(Component component) {
+        Component normalized = normalizeDecorationsIfUnset(component);
+        return normalized == null ? null : normalized.compact();
     }
 
     private Component normalizeDecorationsIfUnset(Component component) {
