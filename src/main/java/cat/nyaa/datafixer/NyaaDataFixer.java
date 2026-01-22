@@ -554,6 +554,10 @@ public class NyaaDataFixer extends JavaPlugin {
             return text;
         }
         String trimmed = text.trim();
+        String inlineUpdated = upgradeInlineLegacyValue(trimmed);
+        if (inlineUpdated != null && !inlineUpdated.equals(trimmed)) {
+            return restoreWhitespace(text, inlineUpdated);
+        }
         LegacyValueCategory category = detectLegacyValueCategory(path, parent, key);
         if (category != LegacyValueCategory.UNKNOWN) {
             String updated = upgradeLegacyValue(trimmed, category);
@@ -1272,37 +1276,71 @@ public class NyaaDataFixer extends JavaPlugin {
         if (category != LegacyValueCategory.UNKNOWN) {
             return category;
         }
-        category = categoryFromPowerName(parent);
+        category = categoryFromPowerName(parent, key);
         if (category != LegacyValueCategory.UNKNOWN) {
             return category;
         }
         return categoryFromPath(path);
     }
 
-    private LegacyValueCategory categoryFromPowerName(ConfigurationSection parent) {
+    private LegacyValueCategory categoryFromPowerName(ConfigurationSection parent, String key) {
         if (parent == null) {
             return LegacyValueCategory.UNKNOWN;
         }
         String powerName = parent.getString("powerName");
-        return categoryFromHint(powerName, false);
+        LegacyValueCategory category = categoryFromHint(powerName, false);
+        if (category != LegacyValueCategory.UNKNOWN) {
+            return category;
+        }
+        if (powerName == null) {
+            return LegacyValueCategory.UNKNOWN;
+        }
+        String lower = powerName.toLowerCase(Locale.ROOT);
+        if ((lower.equals("rpgitems:aoe") || lower.equals("rpgitems:tippedarrows"))
+                && (key == null || "type".equalsIgnoreCase(key))) {
+            return LegacyValueCategory.POTION;
+        }
+        return LegacyValueCategory.UNKNOWN;
     }
 
     private LegacyValueCategory categoryFromPath(Deque<String> path) {
         if (path == null || path.isEmpty()) {
             return LegacyValueCategory.UNKNOWN;
         }
+        boolean potionHint = false;
+        boolean enchantHint = false;
+        boolean materialHint = false;
         for (String entry : path) {
             if ("[]".equals(entry)) {
                 continue;
             }
-            LegacyValueCategory category = categoryFromHint(entry, false);
-            if (category != LegacyValueCategory.UNKNOWN) {
-                return category;
-            }
             String lower = entry.toLowerCase(Locale.ROOT);
-            if (lower.equals("material") || lower.equals("materials")) {
-                return LegacyValueCategory.MATERIAL;
+            if (lower.contains("particle")) {
+                return LegacyValueCategory.PARTICLE;
             }
+            if (lower.contains("sound")) {
+                return LegacyValueCategory.SOUND;
+            }
+            if (lower.contains("enchant")) {
+                enchantHint = true;
+                continue;
+            }
+            if (lower.contains("potion") || lower.equals("effect") || lower.equals("effects") || lower.endsWith("effect")) {
+                potionHint = true;
+                continue;
+            }
+            if (lower.equals("material") || lower.equals("materials")) {
+                materialHint = true;
+            }
+        }
+        if (enchantHint) {
+            return LegacyValueCategory.ENCHANTMENT;
+        }
+        if (potionHint) {
+            return LegacyValueCategory.POTION;
+        }
+        if (materialHint) {
+            return LegacyValueCategory.MATERIAL;
         }
         return LegacyValueCategory.UNKNOWN;
     }
@@ -1342,13 +1380,127 @@ public class NyaaDataFixer extends JavaPlugin {
         }
         ValueStyle style = detectValueStyle(value);
         return switch (category) {
-            case POTION -> mapLegacyValue(value, style, POTION_EFFECT_RENAMES, null, false);
-            case ENCHANTMENT -> mapLegacyValue(value, style, ENCHANTMENT_RENAMES, ENCHANTMENT_AMBIGUOUS, true);
+            case POTION -> upgradePotionValue(value, style);
+            case ENCHANTMENT -> upgradeEnchantmentValue(value, style);
             case PARTICLE -> mapLegacyValue(value, style, PARTICLE_RENAMES, PARTICLE_AMBIGUOUS, true);
             case MATERIAL -> mapLegacyValue(value, style, MATERIAL_RENAMES, null, false);
             case SOUND -> upgradeSoundValue(value, style);
             default -> value;
         };
+    }
+
+    private String upgradePotionValue(String value, ValueStyle style) {
+        String updated = upgradeDelimitedValue(value, LegacyValueCategory.POTION);
+        if (updated != null) {
+            return updated;
+        }
+        return mapLegacyValue(value, style, POTION_EFFECT_RENAMES, null, false);
+    }
+
+    private String upgradeEnchantmentValue(String value, ValueStyle style) {
+        String updated = upgradeDelimitedValue(value, LegacyValueCategory.ENCHANTMENT);
+        if (updated != null) {
+            return updated;
+        }
+        return mapLegacyValue(value, style, ENCHANTMENT_RENAMES, ENCHANTMENT_AMBIGUOUS, true);
+    }
+
+    private String upgradeInlineLegacyValue(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        int idx = value.indexOf(':');
+        if (idx <= 0) {
+            return null;
+        }
+        String prefixRaw = value.substring(0, idx);
+        String prefix = prefixRaw.toLowerCase(Locale.ROOT);
+        LegacyValueCategory category = switch (prefix) {
+            case "effect" -> LegacyValueCategory.POTION;
+            case "enchant" -> LegacyValueCategory.ENCHANTMENT;
+            default -> LegacyValueCategory.UNKNOWN;
+        };
+        if (category == LegacyValueCategory.UNKNOWN) {
+            return null;
+        }
+        String payload = value.substring(idx + 1);
+        if (payload.isEmpty()) {
+            return null;
+        }
+        String updatedPayload = upgradeDelimitedPayload(payload, category);
+        if (updatedPayload.equals(payload)) {
+            return null;
+        }
+        return prefixRaw + ":" + updatedPayload;
+    }
+
+    private String upgradeDelimitedValue(String value, LegacyValueCategory category) {
+        if (value == null || value.indexOf(':') < 0) {
+            return null;
+        }
+        String updated = upgradeDelimitedPayload(value, category);
+        if (updated.equals(value)) {
+            return null;
+        }
+        return updated;
+    }
+
+    private String upgradeDelimitedPayload(String payload, LegacyValueCategory category) {
+        String[] parts = payload.split(":", -1);
+        if (parts.length == 0) {
+            return payload;
+        }
+        int nameIndex = isMinecraftNamespace(parts) ? 1 : 0;
+        String original = parts[nameIndex];
+        String updated = switch (category) {
+            case POTION -> upgradePotionToken(original, nameIndex == 1);
+            case ENCHANTMENT -> upgradeEnchantmentToken(original);
+            default -> original;
+        };
+        if (updated.equals(original)) {
+            return payload;
+        }
+        parts[nameIndex] = updated;
+        return String.join(":", parts);
+    }
+
+    private boolean isMinecraftNamespace(String[] parts) {
+        return parts.length >= 2 && "minecraft".equalsIgnoreCase(parts[0]);
+    }
+
+    private String upgradePotionToken(String token, boolean keyStyle) {
+        String lookup = normalizeEnumToken(token);
+        if (lookup.isEmpty()) {
+            return token;
+        }
+        String mapped = POTION_EFFECT_RENAMES.getOrDefault(lookup, lookup);
+        return keyStyle ? mapped.toLowerCase(Locale.ROOT) : mapped;
+    }
+
+    private String upgradeEnchantmentToken(String token) {
+        String lookup = normalizeEnumToken(token);
+        if (lookup.isEmpty()) {
+            return token;
+        }
+        String mapped = ENCHANTMENT_RENAMES.get(lookup);
+        if (mapped == null) {
+            mapped = ENCHANTMENT_AMBIGUOUS.get(lookup);
+        }
+        if (mapped == null) {
+            mapped = lookup;
+        }
+        return mapped.toLowerCase(Locale.ROOT);
+    }
+
+    private String normalizeEnumToken(String token) {
+        if (token == null) {
+            return "";
+        }
+        String base = token.trim();
+        if (base.indexOf('.') >= 0) {
+            base = base.replace('.', '_');
+        }
+        return base.toUpperCase(Locale.ROOT);
     }
 
     private ValueStyle detectValueStyle(String value) {
@@ -1425,15 +1577,22 @@ public class NyaaDataFixer extends JavaPlugin {
         }
         String lowerBase = base.toLowerCase(Locale.ROOT);
         Sound sound = SOUND_BY_KEY.get(lowerBase);
-        if (sound != null) {
-            return prefix + sound.getKey().getKey();
+        if (sound == null) {
+            String enumCandidate = lowerBase.replace('.', '_').toUpperCase(Locale.ROOT);
+            sound = SOUND_BY_ENUM.get(enumCandidate);
         }
-        String enumCandidate = lowerBase.replace('.', '_').toUpperCase(Locale.ROOT);
-        sound = SOUND_BY_ENUM.get(enumCandidate);
         if (sound != null) {
-            return prefix + sound.getKey().getKey();
+            String updated = formatSoundValue(sound, style);
+            return prefix + updated;
         }
         return value;
+    }
+
+    private String formatSoundValue(Sound sound, ValueStyle style) {
+        if (style == ValueStyle.KEY || style == ValueStyle.ENUM_DOTTED) {
+            return sound.getKey().getKey();
+        }
+        return sound.name();
     }
 
     private String restoreWhitespace(String original, String updated) {
