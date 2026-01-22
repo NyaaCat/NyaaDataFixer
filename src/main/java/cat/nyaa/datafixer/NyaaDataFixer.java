@@ -16,6 +16,7 @@ import net.minecraft.resources.RegistryOps;
 import net.minecraft.util.datafix.DataFixers;
 import net.minecraft.util.datafix.fixes.References;
 import org.bukkit.Bukkit;
+import org.bukkit.Sound;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -47,6 +48,93 @@ import java.util.stream.Stream;
 public class NyaaDataFixer extends JavaPlugin {
     private static final int DEFAULT_ITEMSTACK_DATA_VERSION = 1139;
     private static final Pattern BASE64_PATTERN = Pattern.compile("^[A-Za-z0-9+/=]+$");
+    private static final Pattern ENUM_VALUE_PATTERN = Pattern.compile("^[A-Z0-9_]+$");
+    private static final Pattern ENUM_DOTTED_PATTERN = Pattern.compile("^[A-Z0-9.]+$");
+    private static final Pattern KEY_VALUE_PATTERN = Pattern.compile("^[a-z0-9_]+$");
+
+    private static final Map<String, String> POTION_EFFECT_RENAMES = Map.ofEntries(
+            Map.entry("SLOW", "SLOWNESS"),
+            Map.entry("FAST_DIGGING", "HASTE"),
+            Map.entry("SLOW_DIGGING", "MINING_FATIGUE"),
+            Map.entry("INCREASE_DAMAGE", "STRENGTH"),
+            Map.entry("HEAL", "INSTANT_HEALTH"),
+            Map.entry("HARM", "INSTANT_DAMAGE"),
+            Map.entry("JUMP", "JUMP_BOOST"),
+            Map.entry("CONFUSION", "NAUSEA"),
+            Map.entry("DAMAGE_RESISTANCE", "RESISTANCE")
+    );
+
+    private static final Map<String, String> ENCHANTMENT_RENAMES = Map.ofEntries(
+            Map.entry("PROTECTION_ENVIRONMENTAL", "PROTECTION"),
+            Map.entry("PROTECTION_FIRE", "FIRE_PROTECTION"),
+            Map.entry("PROTECTION_FALL", "FEATHER_FALLING"),
+            Map.entry("PROTECTION_EXPLOSIONS", "BLAST_PROTECTION"),
+            Map.entry("PROTECTION_PROJECTILE", "PROJECTILE_PROTECTION"),
+            Map.entry("OXYGEN", "RESPIRATION"),
+            Map.entry("WATER_WORKER", "AQUA_AFFINITY"),
+            Map.entry("DAMAGE_ALL", "SHARPNESS"),
+            Map.entry("DAMAGE_UNDEAD", "SMITE"),
+            Map.entry("DAMAGE_ARTHROPODS", "BANE_OF_ARTHROPODS"),
+            Map.entry("LOOT_BONUS_MOBS", "LOOTING"),
+            Map.entry("DIG_SPEED", "EFFICIENCY"),
+            Map.entry("DURABILITY", "UNBREAKING"),
+            Map.entry("LOOT_BONUS_BLOCKS", "FORTUNE"),
+            Map.entry("ARROW_DAMAGE", "POWER"),
+            Map.entry("ARROW_KNOCKBACK", "PUNCH"),
+            Map.entry("ARROW_FIRE", "FLAME"),
+            Map.entry("ARROW_INFINITE", "INFINITY")
+    );
+
+    private static final Map<String, String> ENCHANTMENT_AMBIGUOUS = Map.of(
+            "LUCK", "LUCK_OF_THE_SEA"
+    );
+
+    private static final Map<String, String> PARTICLE_RENAMES = Map.ofEntries(
+            Map.entry("EXPLOSION_NORMAL", "POOF"),
+            Map.entry("EXPLOSION_LARGE", "EXPLOSION"),
+            Map.entry("EXPLOSION_HUGE", "EXPLOSION_EMITTER"),
+            Map.entry("FIREWORKS_SPARK", "FIREWORK"),
+            Map.entry("WATER_BUBBLE", "BUBBLE"),
+            Map.entry("WATER_SPLASH", "SPLASH"),
+            Map.entry("WATER_WAKE", "FISHING"),
+            Map.entry("SUSPENDED_DEPTH", "UNDERWATER"),
+            Map.entry("CRIT_MAGIC", "ENCHANTED_HIT"),
+            Map.entry("SMOKE_NORMAL", "SMOKE"),
+            Map.entry("SMOKE_LARGE", "LARGE_SMOKE"),
+            Map.entry("SPELL", "EFFECT"),
+            Map.entry("SPELL_INSTANT", "INSTANT_EFFECT"),
+            Map.entry("SPELL_MOB", "ENTITY_EFFECT"),
+            Map.entry("SPELL_MOB_AMBIENT", "ENTITY_EFFECT"),
+            Map.entry("SPELL_WITCH", "WITCH"),
+            Map.entry("DRIP_WATER", "DRIPPING_WATER"),
+            Map.entry("DRIP_LAVA", "DRIPPING_LAVA"),
+            Map.entry("VILLAGER_ANGRY", "ANGRY_VILLAGER"),
+            Map.entry("VILLAGER_HAPPY", "HAPPY_VILLAGER"),
+            Map.entry("TOWN_AURA", "MYCELIUM"),
+            Map.entry("ENCHANTMENT_TABLE", "ENCHANT"),
+            Map.entry("REDSTONE", "DUST"),
+            Map.entry("ITEM_CRACK", "ITEM"),
+            Map.entry("BLOCK_CRACK", "BLOCK"),
+            Map.entry("BLOCK_DUST", "BLOCK"),
+            Map.entry("WATER_DROP", "RAIN"),
+            Map.entry("MOB_APPEARANCE", "ELDER_GUARDIAN"),
+            Map.entry("TOTEM", "TOTEM_OF_UNDYING"),
+            Map.entry("BARRIER", "BLOCK_MARKER")
+    );
+
+    private static final Map<String, String> PARTICLE_AMBIGUOUS = Map.ofEntries(
+            Map.entry("SNOWBALL", "ITEM_SNOWBALL"),
+            Map.entry("SNOW_SHOVEL", "ITEM_SNOWBALL"),
+            Map.entry("SLIME", "ITEM_SLIME")
+    );
+
+    private static final Map<String, String> MATERIAL_RENAMES = Map.ofEntries(
+            Map.entry("GRASS_PATH", "DIRT_PATH"),
+            Map.entry("GRASS", "SHORT_GRASS")
+    );
+
+    private static final Map<String, Sound> SOUND_BY_KEY = buildSoundKeyMap();
+    private static final Map<String, Sound> SOUND_BY_ENUM = buildSoundEnumMap();
 
     private int currentDataVersion;
     private boolean logUpdatedItemNames;
@@ -114,7 +202,7 @@ public class NyaaDataFixer extends JavaPlugin {
         currentContext = formatContext(file, targetDir);
         boolean changed;
         try {
-            changed = upgradeSection(yaml, fileStats);
+            changed = upgradeSection(yaml, fileStats, new ArrayDeque<>());
         } finally {
             currentContext = previousContext;
         }
@@ -236,7 +324,7 @@ public class NyaaDataFixer extends JavaPlugin {
                 if (value == null) {
                     continue;
                 }
-                String upgraded = upgradeString(value, total);
+                String upgraded = upgradeString(value, total, column);
                 if (upgraded != null && !upgraded.equals(value)) {
                     update.setString(1, upgraded);
                     update.setLong(2, rowId);
@@ -286,7 +374,7 @@ public class NyaaDataFixer extends JavaPlugin {
                 if (value == null) {
                     continue;
                 }
-                String upgraded = upgradeString(value, total);
+                String upgraded = upgradeString(value, total, column);
                 if (upgraded != null && !upgraded.equals(value)) {
                     update.setString(1, upgraded);
                     for (int i = 0; i < pkValues.length; i++) {
@@ -342,28 +430,47 @@ public class NyaaDataFixer extends JavaPlugin {
         return new TableSchema(textColumns, primaryKeys, hasRowId);
     }
 
-    private boolean upgradeSection(ConfigurationSection section, MigrationStats stats) {
+    private boolean upgradeSection(ConfigurationSection section, MigrationStats stats, Deque<String> path) {
         boolean changed = false;
-        for (String key : section.getKeys(false)) {
+        LegacyValueCategory keyCategory = detectLegacyValueCategory(path, section, null);
+        for (String key : new HashSet<>(section.getKeys(false))) {
             Object value = section.get(key);
-            if (value instanceof ConfigurationSection nested) {
-                if (upgradeSection(nested, stats)) {
-                    changed = true;
+            path.addLast(key);
+            try {
+                if (value instanceof ConfigurationSection nested) {
+                    if (upgradeSection(nested, stats, path)) {
+                        changed = true;
+                    }
+                } else {
+                    Object updated = upgradeObject(value, stats, path, section, key);
+                    if (updated != value && !Objects.equals(updated, value)) {
+                        section.set(key, updated);
+                        changed = true;
+                    }
                 }
-                continue;
+            } finally {
+                path.removeLast();
             }
-            Object updated = upgradeObject(value, stats);
-            if (updated != value && !Objects.equals(updated, value)) {
-                section.set(key, updated);
-                changed = true;
+            if (keyCategory != LegacyValueCategory.UNKNOWN) {
+                String updatedKey = upgradeLegacyValue(key, keyCategory);
+                if (updatedKey != null && !updatedKey.equals(key)) {
+                    Object updatedValue = section.get(key);
+                    Object existingValue = section.get(updatedKey);
+                    if (existingValue == null || Objects.equals(existingValue, updatedValue)) {
+                        section.set(updatedKey, updatedValue);
+                        section.set(key, null);
+                        changed = true;
+                    }
+                }
             }
         }
         return changed;
     }
 
-    private Object upgradeObject(Object value, MigrationStats stats) {
+    private Object upgradeObject(Object value, MigrationStats stats, Deque<String> path,
+                                 ConfigurationSection parent, String key) {
         if (value instanceof String text) {
-            return upgradeString(text, stats);
+            return upgradeString(text, stats, path, parent, key);
         }
         if (value instanceof ItemStack item) {
             return upgradeItemStack(item, stats);
@@ -377,34 +484,53 @@ public class NyaaDataFixer extends JavaPlugin {
             return new NbtItemStack(upgraded);
         }
         if (value instanceof Map<?, ?> map) {
-            return upgradeMap(map, stats);
+            return upgradeMap(map, stats, path);
         }
         if (value instanceof List<?> list) {
-            return upgradeList(list, stats);
+            return upgradeList(list, stats, path, parent, key);
         }
         return value;
     }
 
-    private Object upgradeMap(Map<?, ?> map, MigrationStats stats) {
+    private Object upgradeMap(Map<?, ?> map, MigrationStats stats, Deque<String> path) {
         boolean changed = false;
         Map<Object, Object> updated = new LinkedHashMap<>();
+        LegacyValueCategory keyCategory = detectLegacyValueCategory(path, null, null);
         for (Map.Entry<?, ?> entry : map.entrySet()) {
             Object key = entry.getKey();
             Object value = entry.getValue();
-            Object newValue = upgradeObject(value, stats);
+            Object newKey = key;
+            String keyString = key instanceof String ? (String) key : null;
+            if (keyCategory != LegacyValueCategory.UNKNOWN && keyString != null) {
+                String mappedKey = upgradeLegacyValue(keyString, keyCategory);
+                if (mappedKey != null && !mappedKey.equals(keyString)) {
+                    newKey = mappedKey;
+                    changed = true;
+                }
+            }
+            if (keyString != null) {
+                path.addLast(keyString);
+            }
+            Object newValue = upgradeObject(value, stats, path, null, keyString);
+            if (keyString != null) {
+                path.removeLast();
+            }
             if (newValue != value && !Objects.equals(newValue, value)) {
                 changed = true;
             }
-            updated.put(key, newValue);
+            updated.put(newKey, newValue);
         }
         return changed ? updated : map;
     }
 
-    private Object upgradeList(List<?> list, MigrationStats stats) {
+    private Object upgradeList(List<?> list, MigrationStats stats, Deque<String> path,
+                               ConfigurationSection parent, String key) {
         boolean changed = false;
         List<Object> updated = new ArrayList<>(list.size());
         for (Object entry : list) {
-            Object newValue = upgradeObject(entry, stats);
+            path.addLast("[]");
+            Object newValue = upgradeObject(entry, stats, path, parent, key);
+            path.removeLast();
             if (newValue != entry && !Objects.equals(newValue, entry)) {
                 changed = true;
             }
@@ -413,11 +539,28 @@ public class NyaaDataFixer extends JavaPlugin {
         return changed ? updated : list;
     }
 
-    private String upgradeString(String text, MigrationStats stats) {
+    private String upgradeString(String text, MigrationStats stats, String keyHint) {
+        if (keyHint == null || keyHint.isBlank()) {
+            return upgradeString(text, stats, null, null, null);
+        }
+        Deque<String> path = new ArrayDeque<>();
+        path.addLast(keyHint);
+        return upgradeString(text, stats, path, null, keyHint);
+    }
+
+    private String upgradeString(String text, MigrationStats stats, Deque<String> path,
+                                 ConfigurationSection parent, String key) {
         if (text == null || text.isEmpty() || "<null>".equalsIgnoreCase(text)) {
             return text;
         }
         String trimmed = text.trim();
+        LegacyValueCategory category = detectLegacyValueCategory(path, parent, key);
+        if (category != LegacyValueCategory.UNKNOWN) {
+            String updated = upgradeLegacyValue(trimmed, category);
+            if (updated != null && !updated.equals(trimmed)) {
+                return restoreWhitespace(text, updated);
+            }
+        }
         String normalized = normalizeJsonComponentText(trimmed);
         if (normalized != null) {
             return normalized;
@@ -1122,6 +1265,222 @@ public class NyaaDataFixer extends JavaPlugin {
     private String formatContext(Path file, Path targetDir) {
         Path relative = targetDir.relativize(file);
         return targetDir.getFileName() + "/" + relative.toString().replace(File.separatorChar, '/');
+    }
+
+    private LegacyValueCategory detectLegacyValueCategory(Deque<String> path, ConfigurationSection parent, String key) {
+        LegacyValueCategory category = categoryFromHint(key, true);
+        if (category != LegacyValueCategory.UNKNOWN) {
+            return category;
+        }
+        category = categoryFromPowerName(parent);
+        if (category != LegacyValueCategory.UNKNOWN) {
+            return category;
+        }
+        return categoryFromPath(path);
+    }
+
+    private LegacyValueCategory categoryFromPowerName(ConfigurationSection parent) {
+        if (parent == null) {
+            return LegacyValueCategory.UNKNOWN;
+        }
+        String powerName = parent.getString("powerName");
+        return categoryFromHint(powerName, false);
+    }
+
+    private LegacyValueCategory categoryFromPath(Deque<String> path) {
+        if (path == null || path.isEmpty()) {
+            return LegacyValueCategory.UNKNOWN;
+        }
+        for (String entry : path) {
+            if ("[]".equals(entry)) {
+                continue;
+            }
+            LegacyValueCategory category = categoryFromHint(entry, false);
+            if (category != LegacyValueCategory.UNKNOWN) {
+                return category;
+            }
+            String lower = entry.toLowerCase(Locale.ROOT);
+            if (lower.equals("material") || lower.equals("materials")) {
+                return LegacyValueCategory.MATERIAL;
+            }
+        }
+        return LegacyValueCategory.UNKNOWN;
+    }
+
+    private LegacyValueCategory categoryFromHint(String hint, boolean allowMaterial) {
+        if (hint == null || hint.isBlank()) {
+            return LegacyValueCategory.UNKNOWN;
+        }
+        String lower = hint.toLowerCase(Locale.ROOT);
+        if (lower.contains("particle")) {
+            return LegacyValueCategory.PARTICLE;
+        }
+        if (lower.contains("sound")) {
+            return LegacyValueCategory.SOUND;
+        }
+        if (lower.contains("potion")) {
+            return LegacyValueCategory.POTION;
+        }
+        if (lower.equals("effect") || lower.equals("effects") || lower.endsWith("effect")) {
+            return LegacyValueCategory.POTION;
+        }
+        if (lower.contains("enchant")) {
+            return LegacyValueCategory.ENCHANTMENT;
+        }
+        if (allowMaterial && (lower.equals("material") || lower.equals("materials")
+                || lower.equals("item") || lower.equals("items")
+                || lower.equals("block") || lower.equals("blocks")
+                || lower.endsWith("material"))) {
+            return LegacyValueCategory.MATERIAL;
+        }
+        return LegacyValueCategory.UNKNOWN;
+    }
+
+    private String upgradeLegacyValue(String value, LegacyValueCategory category) {
+        if (value == null || category == null || category == LegacyValueCategory.UNKNOWN) {
+            return value;
+        }
+        ValueStyle style = detectValueStyle(value);
+        return switch (category) {
+            case POTION -> mapLegacyValue(value, style, POTION_EFFECT_RENAMES, null, false);
+            case ENCHANTMENT -> mapLegacyValue(value, style, ENCHANTMENT_RENAMES, ENCHANTMENT_AMBIGUOUS, true);
+            case PARTICLE -> mapLegacyValue(value, style, PARTICLE_RENAMES, PARTICLE_AMBIGUOUS, true);
+            case MATERIAL -> mapLegacyValue(value, style, MATERIAL_RENAMES, null, false);
+            case SOUND -> upgradeSoundValue(value, style);
+            default -> value;
+        };
+    }
+
+    private ValueStyle detectValueStyle(String value) {
+        if (value == null) {
+            return ValueStyle.UNKNOWN;
+        }
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            return ValueStyle.UNKNOWN;
+        }
+        if (trimmed.contains(":")) {
+            return ValueStyle.KEY;
+        }
+        if (ENUM_DOTTED_PATTERN.matcher(trimmed).matches() && trimmed.indexOf('.') >= 0) {
+            return ValueStyle.ENUM_DOTTED;
+        }
+        if (ENUM_VALUE_PATTERN.matcher(trimmed).matches()) {
+            return ValueStyle.ENUM;
+        }
+        if (KEY_VALUE_PATTERN.matcher(trimmed).matches()) {
+            return ValueStyle.KEY;
+        }
+        if (trimmed.indexOf('.') >= 0) {
+            return ValueStyle.KEY;
+        }
+        return ValueStyle.UNKNOWN;
+    }
+
+    private String mapLegacyValue(String value, ValueStyle style, Map<String, String> renames,
+                                  Map<String, String> ambiguous, boolean allowAmbiguous) {
+        if (style == ValueStyle.UNKNOWN || value == null) {
+            return value;
+        }
+        String prefix = "";
+        String base = value;
+        if (style == ValueStyle.KEY) {
+            int idx = value.indexOf(':');
+            if (idx >= 0) {
+                prefix = value.substring(0, idx + 1);
+                base = value.substring(idx + 1);
+            }
+            if (base.indexOf('.') >= 0) {
+                return value;
+            }
+        }
+        if (style == ValueStyle.ENUM_DOTTED) {
+            base = base.replace('.', '_');
+        }
+        String lookup = base.toUpperCase(Locale.ROOT);
+        String mapped = renames.get(lookup);
+        if (mapped == null && allowAmbiguous && ambiguous != null) {
+            mapped = ambiguous.get(lookup);
+        }
+        if (mapped == null) {
+            return value;
+        }
+        if (style == ValueStyle.ENUM || style == ValueStyle.ENUM_DOTTED) {
+            return prefix + mapped;
+        }
+        return prefix + mapped.toLowerCase(Locale.ROOT);
+    }
+
+    private String upgradeSoundValue(String value, ValueStyle style) {
+        if (value == null || style == ValueStyle.UNKNOWN) {
+            return value;
+        }
+        String trimmed = value.trim();
+        String prefix = "";
+        String base = trimmed;
+        int idx = trimmed.indexOf(':');
+        if (idx >= 0) {
+            prefix = trimmed.substring(0, idx + 1);
+            base = trimmed.substring(idx + 1);
+        }
+        String lowerBase = base.toLowerCase(Locale.ROOT);
+        Sound sound = SOUND_BY_KEY.get(lowerBase);
+        if (sound != null) {
+            return prefix + sound.getKey().getKey();
+        }
+        String enumCandidate = lowerBase.replace('.', '_').toUpperCase(Locale.ROOT);
+        sound = SOUND_BY_ENUM.get(enumCandidate);
+        if (sound != null) {
+            return prefix + sound.getKey().getKey();
+        }
+        return value;
+    }
+
+    private String restoreWhitespace(String original, String updated) {
+        if (original == null || updated == null) {
+            return original;
+        }
+        int start = 0;
+        int end = original.length();
+        while (start < end && Character.isWhitespace(original.charAt(start))) {
+            start++;
+        }
+        while (end > start && Character.isWhitespace(original.charAt(end - 1))) {
+            end--;
+        }
+        return original.substring(0, start) + updated + original.substring(end);
+    }
+
+    private static Map<String, Sound> buildSoundKeyMap() {
+        Map<String, Sound> map = new HashMap<>();
+        for (Sound sound : Sound.values()) {
+            map.put(sound.getKey().getKey(), sound);
+        }
+        return map;
+    }
+
+    private static Map<String, Sound> buildSoundEnumMap() {
+        Map<String, Sound> map = new HashMap<>();
+        for (Sound sound : Sound.values()) {
+            map.put(sound.name(), sound);
+        }
+        return map;
+    }
+
+    private enum LegacyValueCategory {
+        MATERIAL,
+        ENCHANTMENT,
+        POTION,
+        SOUND,
+        PARTICLE,
+        UNKNOWN
+    }
+
+    private enum ValueStyle {
+        ENUM,
+        ENUM_DOTTED,
+        KEY,
+        UNKNOWN
     }
 
     private static class MigrationConfig {
